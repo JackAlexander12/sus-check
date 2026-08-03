@@ -319,13 +319,19 @@ function App() {
                     <p className="subtle-copy">Community ban present. Treat as conduct context, not cheating proof.</p>
                   ) : null}
                   {profile.profile.playtimeContext.topOtherGames.length ? (
-                    <div className="other-games-list">
+                    <div className="other-games-card">
+                      <div className="other-games-header">
+                        <span>Visible game playtime</span>
+                        <span>scroll for all</span>
+                      </div>
+                      <div className="other-games-list">
                       {profile.profile.playtimeContext.topOtherGames.map((game) => (
                         <div className="other-game-row" key={game.appId}>
                           <span>{game.name}</span>
                           <strong>{formatHours(game.hours)}</strong>
                         </div>
                       ))}
+                      </div>
                     </div>
                   ) : (
                     <p className="subtle-copy">No other visible played games were returned.</p>

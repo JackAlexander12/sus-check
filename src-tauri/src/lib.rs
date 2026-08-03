@@ -516,7 +516,6 @@ fn build_lookup_result(
         })
         .collect::<Vec<_>>();
     top_other_games.sort_by(|left, right| right.hours.total_cmp(&left.hours));
-    top_other_games.truncate(3);
 
     let non_rust_minutes = total_minutes.saturating_sub(rust_game.map(|game| game.playtime_forever).unwrap_or(0));
     let non_rust_hours = owned_games_visible.then(|| minutes_to_hours(non_rust_minutes));
