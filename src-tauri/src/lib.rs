@@ -1,7 +1,9 @@
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use dotenvy::dotenv;
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashSet,
     env,
     fs::{OpenOptions, create_dir_all, remove_dir_all},
     io::Write,
@@ -17,6 +19,15 @@ struct OverlayState {
 }
 
 const RUST_APP_ID: u32 = 252490;
+const CROSSHAIR_X_APP_ID: u32 = 1_366_800;
+const VAC_BAN_REVIEW_WEIGHT: u32 = 65;
+const GAME_BAN_REVIEW_WEIGHT: u32 = 25;
+const REPEATED_BAN_PATTERN_WEIGHT: i32 = 60;
+const PLAYTIME_COVERAGE_REVIEW_WEIGHT: u32 = 20;
+const CROSSHAIR_X_CONTEXT_WEIGHT: i32 = 15;
+const ESTABLISHED_TRACKED_HISTORY_CREDIT: i32 = 20;
+const SUBSTANTIAL_TRACKED_HISTORY_CREDIT: i32 = 10;
+const MAX_BATTLEMETRICS_SESSION_HISTORY_PAGES: usize = 20;
 const ENABLE_LOOKUP_LOGGING: bool = true;
 const SESSION_ONLY_LOOKUP_LOGGING: bool = true;
 const SESSION_LOG_ROOT_DIR: &str = "sus-check-session-logs";
@@ -43,7 +54,7 @@ const WINDOW_LAYOUT: WindowLayoutConfig = WindowLayoutConfig {
 #[serde(rename_all = "camelCase")]
 struct SteamLookupResult {
     profile: ProfileSnapshot,
-    scores: ScoreBundle,
+    decision: DecisionTree,
 }
 
 #[derive(Serialize, Clone)]
@@ -68,18 +79,6 @@ struct GameHours {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct BanRiskSummary {
-    label: String,
-    score: u32,
-    vac_bans: u32,
-    game_bans: u32,
-    days_since_last_ban: Option<u32>,
-    economy_ban: String,
-    community_banned: bool,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
 struct BanContext {
     vac_bans: u32,
     game_bans: u32,
@@ -94,39 +93,40 @@ struct PlaytimeContext {
     owned_games_visible: bool,
     total_games: Option<u32>,
     rust_hours: Option<f32>,
+    crosshair_x_hours: Option<f32>,
     total_hours: Option<f32>,
     non_rust_hours: Option<f32>,
     concentration_ratio: Option<f32>,
     battlemetrics_session_hours: Option<f32>,
     battlemetrics_status: String,
+    battlemetrics_post_ban_hours: Option<f32>,
+    battlemetrics_session_history_status: String,
+    battlemetrics_recent_session_count: Option<u32>,
     steam_minus_session_hours: Option<f32>,
     session_to_steam_ratio: Option<f32>,
-    authenticity_confidence: String,
     notes: Vec<String>,
     top_other_games: Vec<GameHours>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ScoreBundle {
-    overall: ScoreCard,
-    modules: ScoreModules,
+struct DecisionTree {
+    outcome: String,
+    review_priority: u32,
+    evidence_coverage: u32,
+    evidence_level: String,
+    summary: String,
+    next_step: String,
+    branches: Vec<DecisionBranch>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
-struct ScoreModules {
-    bans: ScoreCard,
-    playtime: ScoreCard,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct ScoreCard {
+struct DecisionBranch {
     key: String,
-    score: u32,
     label: String,
-    weight: u32,
+    weight: i32,
+    status: String,
     summary: String,
 }
 
@@ -193,6 +193,55 @@ struct BattleMetricsPlayerRecord {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BattleMetricsPlayerAttributes {
+    #[serde(default)]
+    time_played: Option<f64>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsSessionsResponse {
+    data: Vec<BattleMetricsSessionRecord>,
+    #[serde(default)]
+    links: BattleMetricsPaginationLinks,
+}
+
+#[derive(Default, Deserialize)]
+struct BattleMetricsPaginationLinks {
+    #[serde(default)]
+    next: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsSessionRecord {
+    id: String,
+    attributes: BattleMetricsSessionAttributes,
+    #[serde(default)]
+    relationships: BattleMetricsSessionRelationships,
+}
+
+#[derive(Default, Deserialize)]
+struct BattleMetricsSessionRelationships {
+    #[serde(default)]
+    server: Option<BattleMetricsRelationship>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsRelationship {
+    #[serde(default)]
+    data: Option<BattleMetricsResourceIdentifier>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsResourceIdentifier {
+    id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BattleMetricsSessionAttributes {
+    #[serde(default)]
+    first_time: Option<String>,
+    #[serde(default)]
+    last_time: Option<String>,
     #[serde(default)]
     time_played: Option<f64>,
 }
@@ -474,7 +523,14 @@ fn lookup_steam_profile(app: tauri::AppHandle, steam_id: String) -> Result<Steam
         .json::<OwnedGamesResponse>()
         .map_err(|err| format!("Steam owned games parse failed: {err}"))?;
 
-    let battlemetrics_lookup = fetch_battlemetrics_session_hours(&client, &steam_id);
+    let battlemetrics_lookup = fetch_battlemetrics_session_hours(
+        &client,
+        &steam_id,
+        (ban_record.vac_banned
+            || ban_record.number_of_vac_bans > 0
+            || ban_record.number_of_game_bans > 0)
+            .then_some(ban_record.days_since_last_ban),
+    );
 
     let assessment = build_lookup_result(
         battlemetrics_lookup,
@@ -525,6 +581,11 @@ fn build_lookup_result(
     let owned_games_visible = !owned_games.games.is_empty();
     let rust_game = owned_games.games.iter().find(|game| game.appid == RUST_APP_ID);
     let rust_hours = rust_game.map(|game| minutes_to_hours(game.playtime_forever));
+    let crosshair_x_hours = owned_games
+        .games
+        .iter()
+        .find(|game| game.appid == CROSSHAIR_X_APP_ID)
+        .map(|game| minutes_to_hours(game.playtime_forever));
     let total_minutes: u32 = owned_games.games.iter().map(|game| game.playtime_forever).sum();
     let total_hours = owned_games_visible.then(|| minutes_to_hours(total_minutes));
 
@@ -553,6 +614,9 @@ fn build_lookup_result(
     };
     let battlemetrics_session_hours = battlemetrics_lookup.session_hours;
     let battlemetrics_status = battlemetrics_lookup.status;
+    let battlemetrics_post_ban_hours = battlemetrics_lookup.post_ban_hours;
+    let battlemetrics_session_history_status = battlemetrics_lookup.session_history_status;
+    let battlemetrics_recent_session_count = battlemetrics_lookup.recent_session_count;
     let steam_minus_session_hours = rust_hours.zip(battlemetrics_session_hours).map(|(steam, session)| {
         (steam - session).max(0.0)
     });
@@ -561,128 +625,27 @@ fn build_lookup_result(
     });
 
     let mut notes = Vec::new();
-    let (playtime_label, playtime_summary, authenticity_confidence) = if !owned_games_visible {
+    if !owned_games_visible {
         notes.push(
             "Owned games are not visible from this profile or your key lacks access to that data."
                 .to_string(),
         );
-        (
-            "unknown".to_string(),
-            "Public library data is unavailable, so playtime concentration cannot be assessed."
+    }
+
+    if !owned_games_visible {
+        notes.push(
+            "Steam-recorded Rust hours cannot be compared because the owned-games response is unavailable."
                 .to_string(),
-            "low".to_string(),
-        )
-    } else {
-        if let Some(session_hours) = battlemetrics_session_hours {
-            if let (Some(steam_hours), Some(gap_hours), Some(ratio)) =
-                (rust_hours, steam_minus_session_hours, session_to_steam_ratio)
-            {
-                if steam_hours >= 1500.0 && ratio <= 0.25 && gap_hours >= 800.0 {
-                    notes.push(
-                        "Tracked server-session hours are much lower than Steam Rust hours. That gap can indicate inflated or low-quality hours, but it still needs context."
-                            .to_string(),
-                    );
-                    (
-                        "mismatch".to_string(),
-                        format!(
-                            "Steam Rust hours are far above tracked server-session hours ({steam_hours:.1}h vs {session_hours:.1}h)."
-                        ),
-                        "high".to_string(),
-                    )
-                } else if steam_hours >= 500.0 && ratio <= 0.45 && gap_hours >= 250.0 {
-                    (
-                        "watch".to_string(),
-                        format!(
-                            "Steam Rust hours are materially higher than tracked server-session hours ({steam_hours:.1}h vs {session_hours:.1}h)."
-                        ),
-                        "high".to_string(),
-                    )
-                } else {
-                    (
-                        "tracked".to_string(),
-                        format!(
-                            "Tracked server-session hours are reasonably aligned with Steam Rust hours ({session_hours:.1}h tracked / {steam_hours:.1}h Steam)."
-                        ),
-                        "high".to_string(),
-                    )
-                }
-            } else {
-                (
-                    "tracked".to_string(),
-                    "BattleMetrics session data is present, but the Steam-vs-session comparison is incomplete."
-                        .to_string(),
-                    "medium".to_string(),
-                )
-            }
-        } else if let Some(rust_hours) = rust_hours {
-            if rust_hours >= 1500.0 && non_rust_minutes <= 6000 {
-                notes.push(
-                    format!(
-                        "BattleMetrics session hours are unavailable for this lookup ({battlemetrics_status}), so this remains only a Steam-side concentration heuristic for now."
-                    )
-                        .to_string(),
-                );
-                (
-                    "pending session data".to_string(),
-                    format!(
-                        "Steam Rust hours are high, but tracked server-session hours are unavailable for this lookup ({battlemetrics_status})."
-                    ),
-                    "low".to_string(),
-                )
-            } else if rust_hours < 200.0 {
-                (
-                    "early account".to_string(),
-                    format!(
-                        "Rust playtime is still relatively low; tracked session-hour comparison is unavailable for this lookup ({battlemetrics_status})."
-                    ),
-                    "low".to_string(),
-                )
-            } else {
-                (
-                    "steam only".to_string(),
-                    format!(
-                        "Steam playtime is available, but tracked server-session hours are unavailable for this lookup ({battlemetrics_status})."
-                    ),
-                    "low".to_string(),
-                )
-            }
-        } else {
-            notes.push("Rust was not present in the visible owned-games response.".to_string());
-            (
-                "neutral".to_string(),
-                "This visible library does not currently show Rust ownership or playtime."
-                    .to_string(),
-                "low".to_string(),
-            )
-        }
-    };
+        );
+    } else if battlemetrics_session_hours.is_none() {
+        notes.push(format!(
+            "No tracked BattleMetrics session hours were returned for this lookup ({battlemetrics_status})."
+        ));
+    }
 
-    let ban_risk = compress_ban_risk(&ban_record);
-    let ban_score = ScoreCard {
-        key: "bans".to_string(),
-        score: ban_risk.score,
-        label: ban_risk.label.clone(),
-        weight: 45,
-        summary: format!(
-            "VAC {} | Game {} | Last {}",
-            ban_risk.vac_bans,
-            ban_risk.game_bans,
-            ban_risk
-                .days_since_last_ban
-                .map(|days| format!("{days}d"))
-                .unwrap_or_else(|| "none".to_string())
-        ),
-    };
-
-    let playtime_score = ScoreCard {
-        key: "playtime".to_string(),
-        score: playtime_score_value(rust_hours, battlemetrics_session_hours, owned_games_visible),
-        label: playtime_label.clone(),
-        weight: 20,
-        summary: playtime_summary.clone(),
-    };
-
-    let overall = combine_scores(&[ban_score.clone(), playtime_score.clone()]);
+    let vac_bans = ban_record.number_of_vac_bans.max(u32::from(ban_record.vac_banned));
+    let game_bans = ban_record.number_of_game_bans;
+    let total_bans = vac_bans + game_bans;
 
     let profile = ProfileSnapshot {
         steam_id: player.steamid,
@@ -691,44 +654,51 @@ fn build_lookup_result(
         avatar_url: player.avatarfull,
         community_visibility_state: player.communityvisibilitystate,
         ban_context: BanContext {
-            vac_bans: ban_risk.vac_bans,
-            game_bans: ban_risk.game_bans,
-            days_since_last_ban: ban_risk.days_since_last_ban,
-            economy_ban: ban_risk.economy_ban,
-            community_banned: ban_risk.community_banned,
+            vac_bans,
+            game_bans,
+            days_since_last_ban: (total_bans > 0).then_some(ban_record.days_since_last_ban),
+            economy_ban: ban_record.economy_ban,
+            community_banned: ban_record.community_banned,
         },
         playtime_context: PlaytimeContext {
             owned_games_visible,
             total_games: owned_games_visible.then_some(owned_games.game_count),
             rust_hours,
+            crosshair_x_hours,
             total_hours,
             non_rust_hours,
             concentration_ratio,
             battlemetrics_session_hours,
             battlemetrics_status,
+            battlemetrics_post_ban_hours,
+            battlemetrics_session_history_status,
+            battlemetrics_recent_session_count,
             steam_minus_session_hours,
             session_to_steam_ratio,
-            authenticity_confidence,
             notes,
             top_other_games,
         },
     };
+    let decision = build_decision_tree(&profile);
 
     SteamLookupResult {
         profile,
-        scores: ScoreBundle {
-            overall,
-            modules: ScoreModules {
-                bans: ban_score,
-                playtime: playtime_score,
-            },
-        },
+        decision,
     }
 }
 
 struct BattleMetricsLookup {
     session_hours: Option<f32>,
     status: String,
+    post_ban_hours: Option<f32>,
+    session_history_status: String,
+    recent_session_count: Option<u32>,
+}
+
+struct BattleMetricsSessionHistory {
+    post_ban_hours: Option<f32>,
+    status: String,
+    session_count: Option<u32>,
 }
 
 fn battlemetrics_config() -> Option<(String, Vec<String>)> {
@@ -753,11 +723,15 @@ fn battlemetrics_config() -> Option<(String, Vec<String>)> {
 fn fetch_battlemetrics_session_hours(
     client: &Client,
     steam_id: &str,
+    days_since_last_ban: Option<u32>,
 ) -> BattleMetricsLookup {
     let Some((token, server_ids)) = battlemetrics_config() else {
         return BattleMetricsLookup {
             session_hours: None,
             status: "missing config".to_string(),
+            post_ban_hours: None,
+            session_history_status: "missing config".to_string(),
+            recent_session_count: None,
         };
     };
 
@@ -779,6 +753,9 @@ fn fetch_battlemetrics_session_hours(
             return BattleMetricsLookup {
                 session_hours: None,
                 status: format!("request failed: {error}"),
+                post_ban_hours: None,
+                session_history_status: "player lookup unavailable".to_string(),
+                recent_session_count: None,
             };
         }
     };
@@ -789,6 +766,9 @@ fn fetch_battlemetrics_session_hours(
             return BattleMetricsLookup {
                 session_hours: None,
                 status: format!("parse failed: {error}"),
+                post_ban_hours: None,
+                session_history_status: "player lookup unavailable".to_string(),
+                recent_session_count: None,
             };
         }
     };
@@ -797,8 +777,17 @@ fn fetch_battlemetrics_session_hours(
         return BattleMetricsLookup {
             session_hours: None,
             status: "no matching player records".to_string(),
+            post_ban_hours: None,
+            session_history_status: "no matching player records".to_string(),
+            recent_session_count: None,
         };
     }
+
+    let player_ids = payload
+        .data
+        .iter()
+        .map(|record| record.id.clone())
+        .collect::<Vec<_>>();
 
     let total_seconds = payload
         .data
@@ -810,83 +799,417 @@ fn fetch_battlemetrics_session_hours(
         return BattleMetricsLookup {
             session_hours: None,
             status: format!("matched {} records without timePlayed", payload.data.len()),
+            post_ban_hours: None,
+            session_history_status: "aggregate playtime unavailable".to_string(),
+            recent_session_count: None,
         };
     }
+
+    let session_history = fetch_post_ban_session_history(
+        client,
+        &token,
+        &server_ids,
+        &player_ids,
+        days_since_last_ban,
+    );
 
     BattleMetricsLookup {
         session_hours: Some((((total_seconds / 3600.0) * 10.0).round() / 10.0) as f32),
         status: format!("matched {} records", payload.data.len()),
+        post_ban_hours: session_history.post_ban_hours,
+        session_history_status: session_history.status,
+        recent_session_count: session_history.session_count,
     }
 }
 
-fn playtime_score_value(
-    rust_hours: Option<f32>,
-    battlemetrics_session_hours: Option<f32>,
-    owned_games_visible: bool,
-) -> u32 {
-    if !owned_games_visible {
-        return 0;
+fn fetch_post_ban_session_history(
+    client: &Client,
+    token: &str,
+    server_ids: &[String],
+    player_ids: &[String],
+    days_since_last_ban: Option<u32>,
+) -> BattleMetricsSessionHistory {
+    let Some(days_since_last_ban) = days_since_last_ban else {
+        return BattleMetricsSessionHistory {
+            post_ban_hours: None,
+            status: "not requested: no Steam ban history".to_string(),
+            session_count: None,
+        };
+    };
+
+    let now = DateTime::<Utc>::from(SystemTime::now());
+    let cutoff = now - ChronoDuration::days(i64::from(days_since_last_ban));
+    let mut seen_session_ids = HashSet::new();
+    let mut post_ban_seconds = 0.0;
+    let mut post_ban_sessions = 0_u32;
+    let mut saw_timestamped_session = false;
+
+    for player_id in player_ids {
+        let mut next_url = Some(format!(
+            "https://api.battlemetrics.com/players/{player_id}/relationships/sessions"
+        ));
+        let mut page_number = 0;
+
+        while let Some(url) = next_url.take() {
+            if page_number >= MAX_BATTLEMETRICS_SESSION_HISTORY_PAGES {
+                return BattleMetricsSessionHistory {
+                    post_ban_hours: None,
+                    status: format!(
+                        "partial: session history exceeded {} pages per matched player",
+                        MAX_BATTLEMETRICS_SESSION_HISTORY_PAGES
+                    ),
+                    session_count: None,
+                };
+            }
+            page_number += 1;
+
+            let mut request = client
+                .get(&url)
+                .bearer_auth(token)
+                .query(&[("page[size]", "100"), ("include", "server")]);
+            for server_id in server_ids {
+                request = request.query(&[("filter[servers]", server_id.as_str())]);
+            }
+
+            let response = match request.send().and_then(|response| response.error_for_status()) {
+                Ok(response) => response,
+                Err(error) => {
+                    return BattleMetricsSessionHistory {
+                        post_ban_hours: None,
+                        status: format!("session-history request failed: {error}"),
+                        session_count: None,
+                    };
+                }
+            };
+            let payload = match response.json::<BattleMetricsSessionsResponse>() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return BattleMetricsSessionHistory {
+                        post_ban_hours: None,
+                        status: format!("session-history parse failed: {error}"),
+                        session_count: None,
+                    };
+                }
+            };
+
+            for session in payload.data {
+                let belongs_to_configured_server = session
+                    .relationships
+                    .server
+                    .as_ref()
+                    .and_then(|relationship| relationship.data.as_ref())
+                    .is_some_and(|server| server_ids.iter().any(|server_id| server_id == &server.id));
+                if !belongs_to_configured_server {
+                    continue;
+                }
+                if !seen_session_ids.insert(session.id) {
+                    continue;
+                }
+                let Some(start) = session
+                    .attributes
+                    .first_time
+                    .as_deref()
+                    .and_then(parse_battlemetrics_timestamp)
+                else {
+                    continue;
+                };
+                let end = session
+                    .attributes
+                    .last_time
+                    .as_deref()
+                    .and_then(parse_battlemetrics_timestamp)
+                    .unwrap_or(now);
+                if end <= cutoff {
+                    continue;
+                }
+
+                let elapsed_seconds = (end - start).num_seconds().max(0) as f64;
+                let recorded_seconds = session.attributes.time_played.unwrap_or(elapsed_seconds);
+                if recorded_seconds <= 0.0 || elapsed_seconds <= 0.0 {
+                    continue;
+                }
+
+                let post_ban_start = start.max(cutoff);
+                let post_ban_elapsed_seconds = (end - post_ban_start).num_seconds().max(0) as f64;
+                post_ban_seconds += recorded_seconds * (post_ban_elapsed_seconds / elapsed_seconds);
+                post_ban_sessions += 1;
+                saw_timestamped_session = true;
+            }
+
+            next_url = payload.links.next.map(|link| {
+                if link.starts_with("http") {
+                    link
+                } else {
+                    format!("https://api.battlemetrics.com{link}")
+                }
+            });
+        }
     }
 
-    if let (Some(steam_hours), Some(session_hours)) = (rust_hours, battlemetrics_session_hours) {
-        if steam_hours <= 0.0 {
-            return 0;
-        }
-
-        let gap_hours = (steam_hours - session_hours).max(0.0);
-        let ratio = (session_hours / steam_hours).clamp(0.0, 1.0);
-
-        let mut score = 0;
-        if steam_hours >= 1500.0 && ratio <= 0.25 {
-            score += 60;
-        } else if steam_hours >= 500.0 && ratio <= 0.45 {
-            score += 38;
-        } else if steam_hours >= 250.0 && ratio <= 0.6 {
-            score += 22;
-        }
-
-        if gap_hours >= 1200.0 {
-            score += 30;
-        } else if gap_hours >= 500.0 {
-            score += 18;
-        } else if gap_hours >= 200.0 {
-            score += 8;
-        }
-
-        return score.min(100);
+    if !saw_timestamped_session {
+        return BattleMetricsSessionHistory {
+            post_ban_hours: None,
+            status: "no dated sessions were returned after the latest Steam ban".to_string(),
+            session_count: Some(0),
+        };
     }
 
-    0
+    BattleMetricsSessionHistory {
+        post_ban_hours: Some((((post_ban_seconds / 3600.0) * 10.0).round() / 10.0) as f32),
+        status: format!("{} dated sessions after the latest Steam ban", post_ban_sessions),
+        session_count: Some(post_ban_sessions),
+    }
 }
 
-fn combine_scores(modules: &[ScoreCard]) -> ScoreCard {
-    let total_weight: u32 = modules.iter().map(|module| module.weight).sum();
-    let weighted_sum: u32 = modules
+fn parse_battlemetrics_timestamp(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|timestamp| timestamp.with_timezone(&Utc))
+}
+
+fn build_decision_tree(profile: &ProfileSnapshot) -> DecisionTree {
+    let bans = &profile.ban_context;
+    let playtime = &profile.playtime_context;
+    let mut branches = Vec::new();
+    let days_since_last_ban = bans.days_since_last_ban.unwrap_or(0);
+
+    if bans.vac_bans > 0 {
+        let weight = decayed_ban_weight(VAC_BAN_REVIEW_WEIGHT, bans.vac_bans, days_since_last_ban);
+        branches.push(DecisionBranch {
+            key: "vac_bans".to_string(),
+            label: "VAC ban history".to_string(),
+            weight: weight as i32,
+            status: "factual Steam record".to_string(),
+            summary: format!(
+                "Steam reports {} VAC ban(s); the latest reported ban was {} days ago.",
+                bans.vac_bans, days_since_last_ban
+            ),
+        });
+    }
+
+    if bans.game_bans > 0 {
+        let weight = decayed_ban_weight(GAME_BAN_REVIEW_WEIGHT, bans.game_bans, days_since_last_ban);
+        branches.push(DecisionBranch {
+            key: "game_bans".to_string(),
+            label: "game ban history".to_string(),
+            weight: weight as i32,
+            status: "factual Steam record".to_string(),
+            summary: format!(
+                "Steam reports {} game ban(s); the latest reported ban was {} days ago.",
+                bans.game_bans, days_since_last_ban
+            ),
+        });
+    }
+
+    let total_bans = bans.vac_bans + bans.game_bans;
+    if total_bans >= 2 {
+        branches.push(DecisionBranch {
+            key: "repeated_ban_pattern".to_string(),
+            label: "repeated ban pattern".to_string(),
+            weight: (REPEATED_BAN_PATTERN_WEIGHT + ((total_bans - 2).min(4) as i32 * 5)).min(80),
+            status: "factual Steam record".to_string(),
+            summary: format!(
+                "Steam reports {total_bans} total bans. Multiple bans are treated as a persistent review pattern, even when the latest ban is old."
+            ),
+        });
+    }
+
+    let mut has_tracked_server_history = false;
+    let mut playtime_unavailable = false;
+    if !playtime.owned_games_visible {
+        playtime_unavailable = true;
+        branches.push(DecisionBranch {
+            key: "steam_library".to_string(),
+            label: "Steam library unavailable".to_string(),
+            weight: 0,
+            status: "missing evidence".to_string(),
+            summary: "Steam did not return a visible owned-games library.".to_string(),
+        });
+    } else if let Some(steam_hours) = playtime.rust_hours {
+        if let Some(session_hours) = playtime.battlemetrics_session_hours {
+            has_tracked_server_history = true;
+            let gap_hours = playtime.steam_minus_session_hours.unwrap_or(0.0);
+            let ratio = playtime.session_to_steam_ratio.unwrap_or(0.0);
+            let needs_coverage_review = steam_hours >= 500.0 && ratio <= 0.45 && gap_hours >= 250.0;
+            branches.push(DecisionBranch {
+                key: "tracked_server_hours".to_string(),
+                label: if needs_coverage_review {
+                    "playtime coverage gap"
+                } else {
+                    "tracked-server history"
+                }
+                .to_string(),
+                weight: if needs_coverage_review {
+                    PLAYTIME_COVERAGE_REVIEW_WEIGHT as i32
+                } else {
+                    0
+                },
+                status: "tracked-server lower bound".to_string(),
+                summary: format!(
+                    "Steam reports {steam_hours:.1} Rust hours; configured BattleMetrics servers report {session_hours:.1} session hours."
+                ),
+            });
+
+            if steam_hours >= 10_000.0
+                && gap_hours >= 5_000.0
+                && ratio <= 0.25
+                && playtime.crosshair_x_hours.unwrap_or(0.0) >= 1_000.0
+            {
+                branches.push(DecisionBranch {
+                    key: "crosshair_x_context".to_string(),
+                    label: "crosshair-overlay inconsistency".to_string(),
+                    weight: CROSSHAIR_X_CONTEXT_WEIGHT,
+                    status: "supplemental contextual evidence".to_string(),
+                    summary: format!(
+                        "Steam records {:.1} hours in Crosshair X alongside very high Rust hours and sparse tracked-server time. Crosshair overlays have legitimate uses; this supplements the inconsistency review and does not prove cheating or account purchase.",
+                        playtime.crosshair_x_hours.unwrap_or(0.0)
+                    ),
+                });
+            }
+
+            if let Some(post_ban_hours) = playtime.battlemetrics_post_ban_hours {
+                if post_ban_hours >= 3000.0 {
+                    branches.push(DecisionBranch {
+                        key: "post_ban_tracked_history".to_string(),
+                        label: "established post-ban tracked history".to_string(),
+                        weight: -ESTABLISHED_TRACKED_HISTORY_CREDIT,
+                        status: "counter-evidence".to_string(),
+                        summary: format!(
+                            "Dated BattleMetrics sessions report {post_ban_hours:.1} tracked hours after the latest Steam ban, which reduces the priority of historical ban context."
+                        ),
+                    });
+                } else if post_ban_hours >= 1000.0 {
+                    branches.push(DecisionBranch {
+                        key: "post_ban_tracked_history".to_string(),
+                        label: "substantial post-ban tracked history".to_string(),
+                        weight: -SUBSTANTIAL_TRACKED_HISTORY_CREDIT,
+                        status: "counter-evidence".to_string(),
+                        summary: format!(
+                            "Dated BattleMetrics sessions report {post_ban_hours:.1} tracked hours after the latest Steam ban, which moderately reduces the priority of historical ban context."
+                        ),
+                    });
+                }
+            }
+        } else {
+            playtime_unavailable = true;
+            branches.push(DecisionBranch {
+                key: "tracked_server_hours".to_string(),
+                label: "unverified Steam hours".to_string(),
+                weight: 0,
+                status: "missing evidence".to_string(),
+                summary: format!(
+                    "Steam reports {steam_hours:.1} Rust hours, but no session hours were returned from the configured BattleMetrics servers."
+                ),
+            });
+        }
+    } else {
+        playtime_unavailable = true;
+        branches.push(DecisionBranch {
+            key: "steam_rust_hours".to_string(),
+            label: "no visible Rust hours".to_string(),
+            weight: 0,
+            status: "missing evidence".to_string(),
+            summary: "Rust was not present in the visible Steam owned-games response.".to_string(),
+        });
+    }
+
+    let review_priority = branches
         .iter()
-        .map(|module| module.score.saturating_mul(module.weight))
-        .sum();
-    let score = if total_weight == 0 {
-        0
+        .map(|branch| branch.weight)
+        .sum::<i32>()
+        .clamp(0, 100) as u32;
+    let has_coverage_gap = branches
+        .iter()
+        .any(|branch| branch.key == "tracked_server_hours" && branch.weight > 0);
+    let outcome = if review_priority >= 75 {
+        "manual account review"
+    } else if review_priority >= 35 {
+        "review supporting evidence"
+    } else if has_coverage_gap {
+        "review server coverage"
+    } else if playtime_unavailable {
+        "insufficient playtime evidence"
     } else {
-        weighted_sum / total_weight
+        "context available"
+    };
+    let evidence_level = if has_tracked_server_history {
+        "Steam record + tracked-server lower bound"
+    } else {
+        "Steam profile record"
+    };
+    let evidence_coverage = evidence_coverage(playtime, total_bans > 0);
+    let summary = branches
+        .iter()
+        .map(|branch| branch.summary.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let next_step = if total_bans >= 2 {
+        "Multiple Steam bans remain a persistent review pattern. Use dated server sessions and current behaviour for context, but do not treat the history alone as proof of current cheating."
+    } else if playtime.battlemetrics_post_ban_hours.is_some() {
+        "Dated BattleMetrics sessions provide tracked activity after the latest Steam ban. Treat that as meaningful counter-evidence while keeping the historical ban visible."
+    } else if has_tracked_server_history
+        && days_since_last_ban >= 1095
+        && (bans.vac_bans > 0 || bans.game_bans > 0)
+    {
+        "Keep the historical ban visible, but do not infer current behaviour from it alone. No dated post-ban BattleMetrics sessions were available for this lookup."
+    } else if bans.vac_bans > 0 || bans.game_bans > 0 {
+        "Review the account history manually. Ban records are factual, but they do not establish current or Rust-specific behaviour."
+    } else if has_coverage_gap {
+        "Check whether the configured servers cover the player’s normal activity. A gap does not prove idle or fabricated Steam hours."
+    } else if playtime_unavailable {
+        "Do not infer real playtime or experience until tracked-server session data is available."
+    } else {
+        "Use tracked-session hours as confirmed activity on the configured servers only; they are not a global total."
     };
 
-    let label = if score >= 75 {
-        "high risk"
-    } else if score >= 45 {
-        "elevated"
-    } else if score > 0 {
-        "low signal"
-    } else {
-        "insufficient data"
-    };
+    DecisionTree {
+        outcome: outcome.to_string(),
+        review_priority,
+        evidence_coverage,
+        evidence_level: evidence_level.to_string(),
+        summary,
+        next_step: next_step.to_string(),
+        branches,
+    }
+}
 
-    ScoreCard {
-        key: "overall".to_string(),
-        score,
-        label: label.to_string(),
-        weight: total_weight,
-        summary: "Combined from module-level suspicion signals.".to_string(),
+fn evidence_coverage(playtime: &PlaytimeContext, has_ban_history: bool) -> u32 {
+    let possible_points = if has_ban_history { 100 } else { 80 };
+    let mut observed_points = 30; // Steam account and ban record resolved.
+
+    if playtime.owned_games_visible {
+        observed_points += 20;
+    }
+    if playtime.battlemetrics_session_hours.is_some() {
+        observed_points += 30;
+    }
+    if has_ban_history && playtime.battlemetrics_recent_session_count.is_some() {
+        observed_points += 20;
+    }
+
+    observed_points * 100 / possible_points
+}
+
+fn decayed_ban_weight(base_weight: u32, ban_count: u32, days_since_last_ban: u32) -> u32 {
+    let repeated_ban_weight = (base_weight + (ban_count.saturating_sub(1) * 5)).min(85);
+
+    match days_since_last_ban {
+        0..=180 => repeated_ban_weight,
+        181..=365 => repeated_ban_weight * 2 / 3,
+        366..=1094 => repeated_ban_weight / 3,
+        _ => repeated_ban_weight / 8,
+    }
+}
+
+#[cfg(test)]
+mod decision_tree_tests {
+    use super::*;
+
+    #[test]
+    fn old_bans_receive_a_small_fraction_of_the_recent_weight() {
+        assert_eq!(decayed_ban_weight(VAC_BAN_REVIEW_WEIGHT, 1, 30), 65);
+        assert_eq!(decayed_ban_weight(VAC_BAN_REVIEW_WEIGHT, 1, 1095), 8);
+        assert_eq!(decayed_ban_weight(GAME_BAN_REVIEW_WEIGHT, 1, 1095), 3);
     }
 }
 
@@ -964,55 +1287,6 @@ fn cleanup_stale_session_log_root() -> Result<(), String> {
     }
 
     Ok(())
-}
-
-fn compress_ban_risk(ban_record: &PlayerBanRecord) -> BanRiskSummary {
-    let vac_bans = ban_record.number_of_vac_bans.max(u32::from(ban_record.vac_banned));
-    let game_bans = ban_record.number_of_game_bans;
-    let total_bans = vac_bans + game_bans;
-
-    let recency_score = match ban_record.days_since_last_ban {
-        0 if total_bans == 0 => 0,
-        0..=30 => 30,
-        31..=180 => 22,
-        181..=365 => 16,
-        366..=730 => 10,
-        731..=1825 => 5,
-        _ => 2,
-    };
-
-    let base_score = vac_bans * 45 + game_bans * 14;
-    let repeat_bonus = if total_bans >= 4 {
-        15
-    } else if total_bans >= 2 {
-        8
-    } else {
-        0
-    };
-
-    let score = (base_score + recency_score + repeat_bonus).min(100);
-
-    let label = if total_bans == 0 {
-        "clean"
-    } else if vac_bans > 1 || (vac_bans >= 1 && ban_record.days_since_last_ban <= 180) {
-        "high risk"
-    } else if total_bans >= 2 {
-        "repeat bans"
-    } else if ban_record.days_since_last_ban <= 365 {
-        "recent ban"
-    } else {
-        "old ban"
-    };
-
-    BanRiskSummary {
-        label: label.to_string(),
-        score,
-        vac_bans,
-        game_bans,
-        days_since_last_ban: (total_bans > 0).then_some(ban_record.days_since_last_ban),
-        economy_ban: ban_record.economy_ban.clone(),
-        community_banned: ban_record.community_banned,
-    }
 }
 
 fn minutes_to_hours(minutes: u32) -> f32 {

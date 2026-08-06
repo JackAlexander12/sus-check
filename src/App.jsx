@@ -133,14 +133,48 @@ function App() {
     return `${Math.round(value * 100)}%`;
   }
 
+  function reviewPriorityLabel(value) {
+    if (value >= 75) {
+      return "high review";
+    }
+    if (value >= 45) {
+      return "manual";
+    }
+    if (value >= 20) {
+      return "low review";
+    }
+    return "no action";
+  }
+
+  function evidenceCoverageLabel(value) {
+    if (value >= 80) {
+      return "strong";
+    }
+    if (value >= 55) {
+      return "partial";
+    }
+    return "limited";
+  }
+
   const detailItems = profile
     ? [
         `Steam Rust hours: ${formatHours(profile.profile.playtimeContext.rustHours)}`,
+        `Crosshair X hours: ${formatHours(profile.profile.playtimeContext.crosshairXHours)}`,
         `Tracked session hours: ${formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}`,
         `BattleMetrics status: ${profile.profile.playtimeContext.battlemetricsStatus}`,
+        `Tracked hours after latest Steam ban: ${formatHours(profile.profile.playtimeContext.battlemetricsPostBanHours)}`,
+        `BattleMetrics dated-session status: ${profile.profile.playtimeContext.battlemetricsSessionHistoryStatus}`,
+        `Dated sessions after latest Steam ban: ${profile.profile.playtimeContext.battlemetricsRecentSessionCount ?? "unknown"}`,
         `Steam minus session: ${formatHours(profile.profile.playtimeContext.steamMinusSessionHours)}`,
         `Session / Steam ratio: ${formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}`,
-        `Authenticity confidence: ${profile.profile.playtimeContext.authenticityConfidence}`,
+        `Decision: ${profile.decision.outcome}`,
+        `Review priority: ${profile.decision.reviewPriority}/100`,
+        `Evidence coverage: ${profile.decision.evidenceCoverage}%`,
+        `Evidence level: ${profile.decision.evidenceLevel}`,
+        `Next step: ${profile.decision.nextStep}`,
+        ...profile.decision.branches.map(
+          (branch) => `${branch.label}: ${branch.summary} (${branch.weight}/100 weight; ${branch.status})`,
+        ),
         profile.profile.playtimeContext.totalGames != null
           ? `${profile.profile.playtimeContext.totalGames} Steam games visible`
           : "Steam library visibility limited",
@@ -170,28 +204,26 @@ function App() {
           daysSinceLastBan: profile.profile.banContext.daysSinceLastBan,
           economyBan: profile.profile.banContext.economyBan,
           communityBanned: profile.profile.banContext.communityBanned,
-          score: profile.scores.modules.bans.score,
-          label: profile.scores.modules.bans.label,
         },
         playtime: {
           ownedGamesVisible: profile.profile.playtimeContext.ownedGamesVisible,
           totalGames: profile.profile.playtimeContext.totalGames,
           rustHours: profile.profile.playtimeContext.rustHours,
+          crosshairXHours: profile.profile.playtimeContext.crosshairXHours,
           totalHours: profile.profile.playtimeContext.totalHours,
           nonRustHours: profile.profile.playtimeContext.nonRustHours,
           concentrationRatio: profile.profile.playtimeContext.concentrationRatio,
           battlemetricsSessionHours: profile.profile.playtimeContext.battlemetricsSessionHours,
           battlemetricsStatus: profile.profile.playtimeContext.battlemetricsStatus,
+          battlemetricsPostBanHours: profile.profile.playtimeContext.battlemetricsPostBanHours,
+          battlemetricsSessionHistoryStatus:
+            profile.profile.playtimeContext.battlemetricsSessionHistoryStatus,
+          battlemetricsRecentSessionCount:
+            profile.profile.playtimeContext.battlemetricsRecentSessionCount,
           steamMinusSessionHours: profile.profile.playtimeContext.steamMinusSessionHours,
           sessionToSteamRatio: profile.profile.playtimeContext.sessionToSteamRatio,
-          authenticityConfidence: profile.profile.playtimeContext.authenticityConfidence,
-          score: profile.scores.modules.playtime.score,
-          label: profile.scores.modules.playtime.label,
         },
-        overall: {
-          score: profile.scores.overall.score,
-          label: profile.scores.overall.label,
-        },
+        decision: profile.decision,
       }
     : null;
 
@@ -324,23 +356,23 @@ function App() {
                 <section className="flags">
                   <div
                     className={`flag-row ${
-                      profile.scores.modules.bans.label === "high risk"
+                      profile.profile.banContext.vacBans > 0
                         ? "critical"
-                        : profile.scores.modules.bans.label === "clean"
-                          ? "good"
-                          : "warn"
+                        : profile.profile.banContext.gameBans > 0
+                          ? "warn"
+                          : "good"
                     }`}
                   >
                     <span className="glyph">
-                      {profile.scores.modules.bans.label === "high risk"
+                      {profile.profile.banContext.vacBans > 0
                         ? "!"
-                        : profile.scores.modules.bans.label === "clean"
+                        : profile.profile.banContext.gameBans === 0
                           ? "+"
                           : "~"}
                     </span>
-                    <span>Ban risk</span>
+                    <span>Ban history</span>
                     <strong>
-                      {profile.scores.modules.bans.label} | VAC {profile.profile.banContext.vacBans} | Game{" "}
+                      VAC {profile.profile.banContext.vacBans} | Game{" "}
                       {profile.profile.banContext.gameBans} | Last{" "}
                       {formatBanLastDays(profile.profile.banContext.daysSinceLastBan)}
                     </strong>
@@ -364,17 +396,25 @@ function App() {
                     <span>Steam Rust hours</span>
                     <strong>{formatHours(profile.profile.playtimeContext.rustHours)}</strong>
                   </div>
-                  <div className="flag-row warn">
-                    <span className="glyph">~</span>
+                  <div className={`flag-row ${profile.profile.playtimeContext.battlemetricsSessionHours != null ? "good" : "warn"}`}>
+                    <span className="glyph">{profile.profile.playtimeContext.battlemetricsSessionHours != null ? "+" : "~"}</span>
                     <span>Tracked session hours</span>
                     <strong>{formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}</strong>
                   </div>
                   <div
                     className={`flag-row ${
-                      profile.scores.modules.playtime.score >= 45 ? "critical" : "good"
+                      profile.decision.outcome === "review server coverage" ||
+                      profile.profile.playtimeContext.battlemetricsSessionHours == null
+                        ? "warn"
+                        : "good"
                     }`}
                   >
-                    <span className="glyph">{profile.scores.modules.playtime.score >= 45 ? "!" : "+"}</span>
+                    <span className="glyph">
+                      {profile.decision.outcome === "review server coverage" ||
+                      profile.profile.playtimeContext.battlemetricsSessionHours == null
+                        ? "~"
+                        : "+"}
+                    </span>
                     <span>Session / Steam ratio</span>
                     <strong>
                       {formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}
@@ -384,20 +424,28 @@ function App() {
 
                 <section className="activity-card">
                   <div className="card-header">
-                    <span>Playtime authenticity</span>
+                    <span>Playtime verification</span>
                     <span>
-                      confidence {profile.profile.playtimeContext.authenticityConfidence}
+                      {profile.decision.outcome}
                     </span>
                   </div>
-                  <p className="summary-copy">{profile.scores.modules.playtime.summary}</p>
+                  <p className="summary-copy">{profile.decision.summary}</p>
                   <div className="metric-grid">
                     <div className="metric-tile">
                       <span className="metric-label">Steam Rust</span>
                       <strong>{formatHours(profile.profile.playtimeContext.rustHours)}</strong>
                     </div>
                     <div className="metric-tile">
+                      <span className="metric-label">Crosshair X</span>
+                      <strong>{formatHours(profile.profile.playtimeContext.crosshairXHours)}</strong>
+                    </div>
+                    <div className="metric-tile">
                       <span className="metric-label">Tracked sessions</span>
                       <strong>{formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}</strong>
+                    </div>
+                    <div className="metric-tile">
+                      <span className="metric-label">After latest ban</span>
+                      <strong>{formatHours(profile.profile.playtimeContext.battlemetricsPostBanHours)}</strong>
                     </div>
                     <div className="metric-tile">
                       <span className="metric-label">Steam minus session</span>
@@ -408,19 +456,42 @@ function App() {
                       <strong>{formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}</strong>
                     </div>
                   </div>
-                  <p className="subtle-copy">Open details for supporting notes, extra playtime context, and the visible game list.</p>
+                  <p className="subtle-copy">
+                    Dated BattleMetrics sessions: {profile.profile.playtimeContext.battlemetricsSessionHistoryStatus}
+                  </p>
+                  <p className="subtle-copy">{profile.decision.nextStep}</p>
                 </section>
               </>
             ) : null}
 
             <footer className="scorebar">
               <div>
-                <p className="score-label">Overall score</p>
-                <p className="score-value">{isSuccess ? `${profile.scores.overall.score}` : "--"}</p>
+                <div className="score-label-row">
+                  <p className="score-label">Review priority</p>
+                  <button
+                    type="button"
+                    className="score-explain-button"
+                    aria-label="Open review-priority breakdown"
+                    title="open score breakdown"
+                    disabled={!profile}
+                    onClick={() => setActiveTab("details")}
+                  >
+                    i
+                  </button>
+                </div>
+                <p className="score-value">
+                  {isSuccess
+                    ? `${profile.decision.reviewPriority}/100 · ${reviewPriorityLabel(profile.decision.reviewPriority)}`
+                    : "--"}
+                </p>
               </div>
               <div>
-                <p className="score-label">Overall label</p>
-                <p className="score-value">{isSuccess ? profile.scores.overall.label : "waiting"}</p>
+                <p className="score-label">Evidence coverage</p>
+                <p className="score-value">
+                  {isSuccess
+                    ? `${profile.decision.evidenceCoverage}% · ${evidenceCoverageLabel(profile.decision.evidenceCoverage)}`
+                    : "waiting"}
+                </p>
               </div>
             </footer>
 
@@ -431,8 +502,12 @@ function App() {
         ) : activeTab === "details" ? (
           <section className="details-panel">
             <div className="card-header">
-              <span>Detail notes</span>
-              <span>{profile ? `${detailItems.length} bullets` : "no profile"}</span>
+              <span>Review breakdown</span>
+              <span>
+                {profile
+                  ? `${profile.decision.reviewPriority}/100 · ${profile.decision.evidenceCoverage}% coverage`
+                  : "no profile"}
+              </span>
             </div>
             {profile ? (
               <div className="details-scroll">

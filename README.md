@@ -36,6 +36,7 @@ The current panel supports:
 - validating that the Steam account exists
 - fetching visible library/playtime data
 - showing Rust hours, non-Rust hours, visible game count, and top other games
+- optionally comparing configured BattleMetrics server hours and dated post-ban session history
 
 This is intentionally framed as heuristic context only, not a cheating verdict.
 
