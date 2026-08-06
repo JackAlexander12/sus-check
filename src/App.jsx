@@ -117,7 +117,7 @@ function App() {
 
   function formatHours(value) {
     if (value == null) {
-      return "private";
+      return "unknown";
     }
     return `${value.toFixed(1)}h`;
   }
@@ -125,6 +125,75 @@ function App() {
   function formatBanLastDays(value) {
     return value != null ? `${value}d` : "none";
   }
+
+  function formatPercent(value) {
+    if (value == null) {
+      return "unknown";
+    }
+    return `${Math.round(value * 100)}%`;
+  }
+
+  const detailItems = profile
+    ? [
+        `Steam Rust hours: ${formatHours(profile.profile.playtimeContext.rustHours)}`,
+        `Tracked session hours: ${formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}`,
+        `BattleMetrics status: ${profile.profile.playtimeContext.battlemetricsStatus}`,
+        `Steam minus session: ${formatHours(profile.profile.playtimeContext.steamMinusSessionHours)}`,
+        `Session / Steam ratio: ${formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}`,
+        `Authenticity confidence: ${profile.profile.playtimeContext.authenticityConfidence}`,
+        profile.profile.playtimeContext.totalGames != null
+          ? `${profile.profile.playtimeContext.totalGames} Steam games visible`
+          : "Steam library visibility limited",
+        profile.profile.playtimeContext.battlemetricsSessionHours == null
+          ? `BattleMetrics session-hour fetch did not return tracked hours for this lookup (${profile.profile.playtimeContext.battlemetricsStatus}).`
+          : "Tracked session hours are available for comparison against Steam Rust hours.",
+        ...(profile.profile.banContext.economyBan &&
+        profile.profile.banContext.economyBan !== "none"
+          ? [`Economy ban: ${profile.profile.banContext.economyBan}`]
+          : []),
+        ...(profile.profile.banContext.communityBanned
+          ? ["Community ban present. Treat as conduct context, not cheating proof."]
+          : []),
+        ...(profile.profile.playtimeContext.topOtherGames.length
+          ? profile.profile.playtimeContext.topOtherGames.map(
+              (game) => `Other visible Steam playtime: ${game.name} ${formatHours(game.hours)}`,
+            )
+          : ["No other visible played games were returned."]),
+        ...profile.profile.playtimeContext.notes,
+      ]
+    : [];
+  const rawOutputs = profile
+    ? {
+        bans: {
+          vacBans: profile.profile.banContext.vacBans,
+          gameBans: profile.profile.banContext.gameBans,
+          daysSinceLastBan: profile.profile.banContext.daysSinceLastBan,
+          economyBan: profile.profile.banContext.economyBan,
+          communityBanned: profile.profile.banContext.communityBanned,
+          score: profile.scores.modules.bans.score,
+          label: profile.scores.modules.bans.label,
+        },
+        playtime: {
+          ownedGamesVisible: profile.profile.playtimeContext.ownedGamesVisible,
+          totalGames: profile.profile.playtimeContext.totalGames,
+          rustHours: profile.profile.playtimeContext.rustHours,
+          totalHours: profile.profile.playtimeContext.totalHours,
+          nonRustHours: profile.profile.playtimeContext.nonRustHours,
+          concentrationRatio: profile.profile.playtimeContext.concentrationRatio,
+          battlemetricsSessionHours: profile.profile.playtimeContext.battlemetricsSessionHours,
+          battlemetricsStatus: profile.profile.playtimeContext.battlemetricsStatus,
+          steamMinusSessionHours: profile.profile.playtimeContext.steamMinusSessionHours,
+          sessionToSteamRatio: profile.profile.playtimeContext.sessionToSteamRatio,
+          authenticityConfidence: profile.profile.playtimeContext.authenticityConfidence,
+          score: profile.scores.modules.playtime.score,
+          label: profile.scores.modules.playtime.label,
+        },
+        overall: {
+          score: profile.scores.overall.score,
+          label: profile.scores.overall.label,
+        },
+      }
+    : null;
 
   return (
     <main
@@ -148,6 +217,20 @@ function App() {
             <span className="status-pill">
               {isFetching ? "LOOKUP" : "READY"}
             </span>
+            <button
+              type="button"
+              className={`header-toggle${activeTab === "details" ? " active" : ""}`}
+              aria-label={activeTab === "details" ? "Return to lookup" : "Open details"}
+              title={activeTab === "details" ? "back to lookup" : "open details"}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={(event) => {
+                event.stopPropagation();
+                setActiveTab((current) => (current === "details" ? "lookup" : "details"));
+              }}
+              disabled={!profile}
+            >
+              ≣
+            </button>
             <button
               type="button"
               className={`header-toggle${activeTab === "settings" ? " active" : ""}`}
@@ -278,13 +361,13 @@ function App() {
                   </div>
                   <div className="flag-row warn">
                     <span className="glyph">~</span>
-                    <span>Rust hours</span>
+                    <span>Steam Rust hours</span>
                     <strong>{formatHours(profile.profile.playtimeContext.rustHours)}</strong>
                   </div>
                   <div className="flag-row warn">
                     <span className="glyph">~</span>
-                    <span>Other visible game hours</span>
-                    <strong>{formatHours(profile.profile.playtimeContext.nonRustHours)}</strong>
+                    <span>Tracked session hours</span>
+                    <strong>{formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}</strong>
                   </div>
                   <div
                     className={`flag-row ${
@@ -292,55 +375,40 @@ function App() {
                     }`}
                   >
                     <span className="glyph">{profile.scores.modules.playtime.score >= 45 ? "!" : "+"}</span>
-                    <span>Library concentration</span>
+                    <span>Session / Steam ratio</span>
                     <strong>
-                      {profile.profile.playtimeContext.concentrationRatio != null
-                        ? `${Math.round(profile.profile.playtimeContext.concentrationRatio * 100)}% Rust`
-                        : "unknown"}
+                      {formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}
                     </strong>
                   </div>
                 </section>
 
                 <section className="activity-card">
                   <div className="card-header">
-                    <span>Playtime context</span>
+                    <span>Playtime authenticity</span>
                     <span>
-                      {profile.profile.playtimeContext.totalGames != null
-                        ? `${profile.profile.playtimeContext.totalGames} games visible`
-                        : "visibility limited"}
+                      confidence {profile.profile.playtimeContext.authenticityConfidence}
                     </span>
                   </div>
                   <p className="summary-copy">{profile.scores.modules.playtime.summary}</p>
-                  {profile.profile.banContext.economyBan &&
-                  profile.profile.banContext.economyBan !== "none" ? (
-                    <p className="subtle-copy">Economy ban: {profile.profile.banContext.economyBan}</p>
-                  ) : null}
-                  {profile.profile.banContext.communityBanned ? (
-                    <p className="subtle-copy">Community ban present. Treat as conduct context, not cheating proof.</p>
-                  ) : null}
-                  {profile.profile.playtimeContext.topOtherGames.length ? (
-                    <div className="other-games-card">
-                      <div className="other-games-header">
-                        <span>Visible game playtime</span>
-                        <span>scroll for all</span>
-                      </div>
-                      <div className="other-games-list">
-                      {profile.profile.playtimeContext.topOtherGames.map((game) => (
-                        <div className="other-game-row" key={game.appId}>
-                          <span>{game.name}</span>
-                          <strong>{formatHours(game.hours)}</strong>
-                        </div>
-                      ))}
-                      </div>
+                  <div className="metric-grid">
+                    <div className="metric-tile">
+                      <span className="metric-label">Steam Rust</span>
+                      <strong>{formatHours(profile.profile.playtimeContext.rustHours)}</strong>
                     </div>
-                  ) : (
-                    <p className="subtle-copy">No other visible played games were returned.</p>
-                  )}
-                  {profile.profile.playtimeContext.notes.map((note) => (
-                    <p className="subtle-copy" key={note}>
-                      {note}
-                    </p>
-                  ))}
+                    <div className="metric-tile">
+                      <span className="metric-label">Tracked sessions</span>
+                      <strong>{formatHours(profile.profile.playtimeContext.battlemetricsSessionHours)}</strong>
+                    </div>
+                    <div className="metric-tile">
+                      <span className="metric-label">Steam minus session</span>
+                      <strong>{formatHours(profile.profile.playtimeContext.steamMinusSessionHours)}</strong>
+                    </div>
+                    <div className="metric-tile">
+                      <span className="metric-label">Session / Steam</span>
+                      <strong>{formatPercent(profile.profile.playtimeContext.sessionToSteamRatio)}</strong>
+                    </div>
+                  </div>
+                  <p className="subtle-copy">Open details for supporting notes, extra playtime context, and the visible game list.</p>
                 </section>
               </>
             ) : null}
@@ -360,6 +428,35 @@ function App() {
               Alt+Shift+P hides or restores the overlay. Alt+Shift+M minimizes or restores it.
             </p>
           </>
+        ) : activeTab === "details" ? (
+          <section className="details-panel">
+            <div className="card-header">
+              <span>Detail notes</span>
+              <span>{profile ? `${detailItems.length} bullets` : "no profile"}</span>
+            </div>
+            {profile ? (
+              <div className="details-scroll">
+                <ul className="details-list">
+                  {detailItems.map((item) => (
+                    <li className="details-item" key={item}>
+                      {item}
+                    </li>
+                  ))}
+                </ul>
+                <div className="raw-output-card">
+                  <div className="other-games-header">
+                    <span>Raw outputs</span>
+                    <span>live payload</span>
+                  </div>
+                  <pre className="raw-output-block">
+                    {JSON.stringify(rawOutputs, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            ) : (
+              <p className="subtle-copy">Run a lookup first to populate details.</p>
+            )}
+          </section>
         ) : (
           <section className="settings-panel">
             <div className="display-controls settings-grid">

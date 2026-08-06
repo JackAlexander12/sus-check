@@ -45,6 +45,8 @@ Create a local `.env` file in the repo root:
 
 ```env
 STEAM_WEB_API_KEY=replace_me
+BATTLEMETRICS_API_TOKEN=replace_me
+BATTLEMETRICS_SERVER_IDS=1234567,7654321
 ```
 
 The real `.env` file is gitignored. Use `.env.example` as the template.
@@ -66,4 +68,5 @@ npm run tauri dev
 ## Notes
 
 - Steam profile/library visibility still limits what data can be shown.
+- BattleMetrics Steam64ID lookup requires owner/admin access to the servers in `BATTLEMETRICS_SERVER_IDS`; if that scope or token is wrong, tracked session hours will stay unavailable.
 - Requiring each end user to supply a Steam key is only acceptable for development. The intended production path is a hosted API provider.

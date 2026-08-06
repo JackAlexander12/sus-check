@@ -97,6 +97,11 @@ struct PlaytimeContext {
     total_hours: Option<f32>,
     non_rust_hours: Option<f32>,
     concentration_ratio: Option<f32>,
+    battlemetrics_session_hours: Option<f32>,
+    battlemetrics_status: String,
+    steam_minus_session_hours: Option<f32>,
+    session_to_steam_ratio: Option<f32>,
+    authenticity_confidence: String,
     notes: Vec<String>,
     top_other_games: Vec<GameHours>,
 }
@@ -172,6 +177,24 @@ struct OwnedGame {
 #[derive(Serialize, Deserialize, Clone)]
 struct PlayerBansResponse {
     players: Vec<PlayerBanRecord>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsPlayersResponse {
+    data: Vec<BattleMetricsPlayerRecord>,
+}
+
+#[derive(Deserialize)]
+struct BattleMetricsPlayerRecord {
+    id: String,
+    attributes: BattleMetricsPlayerAttributes,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BattleMetricsPlayerAttributes {
+    #[serde(default)]
+    time_played: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -451,7 +474,10 @@ fn lookup_steam_profile(app: tauri::AppHandle, steam_id: String) -> Result<Steam
         .json::<OwnedGamesResponse>()
         .map_err(|err| format!("Steam owned games parse failed: {err}"))?;
 
+    let battlemetrics_lookup = fetch_battlemetrics_session_hours(&client, &steam_id);
+
     let assessment = build_lookup_result(
+        battlemetrics_lookup,
         player,
         ban_record,
         owned_games_response.response.clone(),
@@ -491,6 +517,7 @@ fn normalize_steam_id(raw: &str) -> Result<String, String> {
 }
 
 fn build_lookup_result(
+    battlemetrics_lookup: BattleMetricsLookup,
     player: SteamPlayer,
     ban_record: PlayerBanRecord,
     owned_games: OwnedGamesBody,
@@ -524,9 +551,17 @@ fn build_lookup_result(
     } else {
         None
     };
+    let battlemetrics_session_hours = battlemetrics_lookup.session_hours;
+    let battlemetrics_status = battlemetrics_lookup.status;
+    let steam_minus_session_hours = rust_hours.zip(battlemetrics_session_hours).map(|(steam, session)| {
+        (steam - session).max(0.0)
+    });
+    let session_to_steam_ratio = rust_hours.zip(battlemetrics_session_hours).and_then(|(steam, session)| {
+        (steam > 0.0).then_some((session / steam).clamp(0.0, 1.0))
+    });
 
     let mut notes = Vec::new();
-    let (playtime_label, playtime_summary) = if !owned_games_visible {
+    let (playtime_label, playtime_summary, authenticity_confidence) = if !owned_games_visible {
         notes.push(
             "Owned games are not visible from this profile or your key lacks access to that data."
                 .to_string(),
@@ -535,30 +570,80 @@ fn build_lookup_result(
             "unknown".to_string(),
             "Public library data is unavailable, so playtime concentration cannot be assessed."
                 .to_string(),
+            "low".to_string(),
         )
     } else {
-        if let Some(rust_hours) = rust_hours {
+        if let Some(session_hours) = battlemetrics_session_hours {
+            if let (Some(steam_hours), Some(gap_hours), Some(ratio)) =
+                (rust_hours, steam_minus_session_hours, session_to_steam_ratio)
+            {
+                if steam_hours >= 1500.0 && ratio <= 0.25 && gap_hours >= 800.0 {
+                    notes.push(
+                        "Tracked server-session hours are much lower than Steam Rust hours. That gap can indicate inflated or low-quality hours, but it still needs context."
+                            .to_string(),
+                    );
+                    (
+                        "mismatch".to_string(),
+                        format!(
+                            "Steam Rust hours are far above tracked server-session hours ({steam_hours:.1}h vs {session_hours:.1}h)."
+                        ),
+                        "high".to_string(),
+                    )
+                } else if steam_hours >= 500.0 && ratio <= 0.45 && gap_hours >= 250.0 {
+                    (
+                        "watch".to_string(),
+                        format!(
+                            "Steam Rust hours are materially higher than tracked server-session hours ({steam_hours:.1}h vs {session_hours:.1}h)."
+                        ),
+                        "high".to_string(),
+                    )
+                } else {
+                    (
+                        "tracked".to_string(),
+                        format!(
+                            "Tracked server-session hours are reasonably aligned with Steam Rust hours ({session_hours:.1}h tracked / {steam_hours:.1}h Steam)."
+                        ),
+                        "high".to_string(),
+                    )
+                }
+            } else {
+                (
+                    "tracked".to_string(),
+                    "BattleMetrics session data is present, but the Steam-vs-session comparison is incomplete."
+                        .to_string(),
+                    "medium".to_string(),
+                )
+            }
+        } else if let Some(rust_hours) = rust_hours {
             if rust_hours >= 1500.0 && non_rust_minutes <= 6000 {
                 notes.push(
-                    "Heavy Rust concentration with very little visible playtime elsewhere can be worth a closer look, but it is still only a heuristic."
+                    format!(
+                        "BattleMetrics session hours are unavailable for this lookup ({battlemetrics_status}), so this remains only a Steam-side concentration heuristic for now."
+                    )
                         .to_string(),
                 );
                 (
-                    "warn".to_string(),
-                    "Library appears highly Rust-concentrated relative to visible playtime in other games."
-                        .to_string(),
+                    "pending session data".to_string(),
+                    format!(
+                        "Steam Rust hours are high, but tracked server-session hours are unavailable for this lookup ({battlemetrics_status})."
+                    ),
+                    "low".to_string(),
                 )
             } else if rust_hours < 200.0 {
                 (
-                    "info".to_string(),
-                    "Rust playtime is still relatively low; that can matter for context but is not a cheating signal by itself."
-                        .to_string(),
+                    "early account".to_string(),
+                    format!(
+                        "Rust playtime is still relatively low; tracked session-hour comparison is unavailable for this lookup ({battlemetrics_status})."
+                    ),
+                    "low".to_string(),
                 )
             } else {
                 (
-                    "neutral".to_string(),
-                    "Visible game library looks more mixed, so playtime concentration alone is not especially notable."
-                        .to_string(),
+                    "steam only".to_string(),
+                    format!(
+                        "Steam playtime is available, but tracked server-session hours are unavailable for this lookup ({battlemetrics_status})."
+                    ),
+                    "low".to_string(),
                 )
             }
         } else {
@@ -567,6 +652,7 @@ fn build_lookup_result(
                 "neutral".to_string(),
                 "This visible library does not currently show Rust ownership or playtime."
                     .to_string(),
+                "low".to_string(),
             )
         }
     };
@@ -590,12 +676,7 @@ fn build_lookup_result(
 
     let playtime_score = ScoreCard {
         key: "playtime".to_string(),
-        score: playtime_score_value(
-            rust_hours,
-            non_rust_hours,
-            concentration_ratio,
-            owned_games_visible,
-        ),
+        score: playtime_score_value(rust_hours, battlemetrics_session_hours, owned_games_visible),
         label: playtime_label.clone(),
         weight: 20,
         summary: playtime_summary.clone(),
@@ -623,6 +704,11 @@ fn build_lookup_result(
             total_hours,
             non_rust_hours,
             concentration_ratio,
+            battlemetrics_session_hours,
+            battlemetrics_status,
+            steam_minus_session_hours,
+            session_to_steam_ratio,
+            authenticity_confidence,
             notes,
             top_other_games,
         },
@@ -640,44 +726,137 @@ fn build_lookup_result(
     }
 }
 
+struct BattleMetricsLookup {
+    session_hours: Option<f32>,
+    status: String,
+}
+
+fn battlemetrics_config() -> Option<(String, Vec<String>)> {
+    let token = env::var("BATTLEMETRICS_API_TOKEN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let server_ids = env::var("BATTLEMETRICS_SERVER_IDS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(|item| item.trim().to_string())
+                .filter(|item| !item.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .filter(|value| !value.is_empty())?;
+
+    Some((token, server_ids))
+}
+
+fn fetch_battlemetrics_session_hours(
+    client: &Client,
+    steam_id: &str,
+) -> BattleMetricsLookup {
+    let Some((token, server_ids)) = battlemetrics_config() else {
+        return BattleMetricsLookup {
+            session_hours: None,
+            status: "missing config".to_string(),
+        };
+    };
+
+    let mut request = client
+        .get("https://api.battlemetrics.com/players")
+        .bearer_auth(token)
+        .query(&[
+            ("filter[search]", steam_id),
+            ("page[size]", "100"),
+        ]);
+
+    for server_id in &server_ids {
+        request = request.query(&[("filter[servers]", server_id.as_str())]);
+    }
+
+    let response = match request.send().and_then(|response| response.error_for_status()) {
+        Ok(response) => response,
+        Err(error) => {
+            return BattleMetricsLookup {
+                session_hours: None,
+                status: format!("request failed: {error}"),
+            };
+        }
+    };
+
+    let payload = match response.json::<BattleMetricsPlayersResponse>() {
+        Ok(payload) => payload,
+        Err(error) => {
+            return BattleMetricsLookup {
+                session_hours: None,
+                status: format!("parse failed: {error}"),
+            };
+        }
+    };
+
+    if payload.data.is_empty() {
+        return BattleMetricsLookup {
+            session_hours: None,
+            status: "no matching player records".to_string(),
+        };
+    }
+
+    let total_seconds = payload
+        .data
+        .iter()
+        .filter_map(|record| record.attributes.time_played)
+        .sum::<f64>();
+
+    if total_seconds <= 0.0 {
+        return BattleMetricsLookup {
+            session_hours: None,
+            status: format!("matched {} records without timePlayed", payload.data.len()),
+        };
+    }
+
+    BattleMetricsLookup {
+        session_hours: Some((((total_seconds / 3600.0) * 10.0).round() / 10.0) as f32),
+        status: format!("matched {} records", payload.data.len()),
+    }
+}
+
 fn playtime_score_value(
     rust_hours: Option<f32>,
-    non_rust_hours: Option<f32>,
-    concentration_ratio: Option<f32>,
+    battlemetrics_session_hours: Option<f32>,
     owned_games_visible: bool,
 ) -> u32 {
     if !owned_games_visible {
         return 0;
     }
 
-    let mut score = 0;
-    if let Some(ratio) = concentration_ratio {
-        if ratio >= 0.9 {
-            score += 35;
-        } else if ratio >= 0.75 {
-            score += 24;
-        } else if ratio >= 0.6 {
-            score += 14;
+    if let (Some(steam_hours), Some(session_hours)) = (rust_hours, battlemetrics_session_hours) {
+        if steam_hours <= 0.0 {
+            return 0;
         }
-    }
 
-    if let Some(hours) = rust_hours {
-        if hours >= 1500.0 {
-            score += 20;
-        } else if hours >= 500.0 {
-            score += 10;
+        let gap_hours = (steam_hours - session_hours).max(0.0);
+        let ratio = (session_hours / steam_hours).clamp(0.0, 1.0);
+
+        let mut score = 0;
+        if steam_hours >= 1500.0 && ratio <= 0.25 {
+            score += 60;
+        } else if steam_hours >= 500.0 && ratio <= 0.45 {
+            score += 38;
+        } else if steam_hours >= 250.0 && ratio <= 0.6 {
+            score += 22;
         }
-    }
 
-    if let Some(other_hours) = non_rust_hours {
-        if other_hours <= 100.0 {
-            score += 15;
-        } else if other_hours <= 300.0 {
+        if gap_hours >= 1200.0 {
+            score += 30;
+        } else if gap_hours >= 500.0 {
+            score += 18;
+        } else if gap_hours >= 200.0 {
             score += 8;
         }
+
+        return score.min(100);
     }
 
-    score.min(100)
+    0
 }
 
 fn combine_scores(modules: &[ScoreCard]) -> ScoreCard {
